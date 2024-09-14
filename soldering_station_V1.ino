@@ -47,7 +47,7 @@ bool      beepEnable  = BEEP_ENABLE;
 // Menu items
 const char *SetupItems[]       = { "Setup Menu", "Temp Settings",
                                    "Timer Settings", "Control Type", "Main Screen",
-                                   "Buzzer", "Information", "Return" };
+                                   "Buzzer", "Information", "Turn OFF", "Return" };
 const char *TempItems[]        = { "Temp Settings", "Default Temp", "Return" };
 const char *TimerItems[]       = { "Timer Settings","Off Timer", "Return" };
 const char *ControlTypeItems[] = { "Control Type", "Direct", "PID" };
@@ -65,22 +65,25 @@ volatile int      count, countMin, countMax, countStep;
 volatile bool     handleMoved;
 
 // State variables
+//TODO: handle this flags and states properly
 volatile enum State {heating, controlling, shut_down} state;
 bool      inOffMode   = false;
 bool      isWorky     = true;
 bool      beepIfWorky = true;
-// bool      TipIsPresent= true;
+bool showPopup = false;
+bool IdleScreen = false;
+bool systemoff = false;
 
 // Timing variables
-uint32_t  sleepmillis;
+unsigned long sleepmillis;
+unsigned long elapsedSeconds;
+unsigned long remainingSeconds;
+const unsigned long warningInterval = 30;
 uint32_t  buttonmillis;
-uint8_t   goneMinutes;
-uint8_t   goneSeconds;
 unsigned long _lastIncReadTime = micros(); 
 unsigned long _lastDecReadTime = micros(); 
 int _pauseLength = 25000;
 int _fastIncrement = 5;
-int remainingSeconds = 40;  // for countdown
 unsigned long lastReadTime = 0;         // last temperature read (for thermocouple)
 const unsigned long readInterval = 250; // time between readings in milliseconds
 
@@ -89,18 +92,10 @@ uint16_t  SetTemp, ShowTemp, gap, Step;
 double    Input, Output, Setpoint, RawTemp, CurrentTemp, ChipTemp;
 
 float real_temp;           //We will store here the real temp 
-// float Setpoint = 100;      //In degrees C
-float SetpointDiff = 20;   //In degrees C
+float SetpointDiff = 15;   //In degrees C
 float elapsedTime, now_time, prev_time;        //Variables for time control
 float refresh_rate = 200;                   //PID loop time in ms
 float now_pid_error, prev_pid_error;
-
-// //Thermistor (can read from -40 to 300 but in this application we wont need negatives)
-// float current;
-// int termNom = 100000; // Thermistor reference resistance
-// int refTemp = 25;   // Temperature for reference resistance
-// int beta = 3950;   // Beta factor
-// int resistance = 100000; // value of resistance in series in the circuit
 
 
 ///////////////////PID constants///////////////////////
@@ -172,22 +167,21 @@ void setup() {
   // delay(500); //for max6675
 }
 
-bool showPopup = false;  // Flag to control screen display
-bool IdleScreen = false;
 void loop() {
   ROTARYCheck();      // check rotary encoder (temp/boost setting, enter setup menu)
   
-  // SLEEPCheck();       // check and activate/deactivate sleep modes
-  SLEEPCheck(remainingSeconds);  // Pass remainingSeconds to SLEEPCheck to be updated
+  SLEEPCheck();       // check and activate/deactivate sleep modes
 
   read_temperature();
 
   switch(state)	{
 		case heating: //first state
+      systemoff = false;
       ramp_up();
       break;
 
     case controlling: //main state
+      systemoff = false;
       PID_control();
       if(real_temp < (Setpoint - SetpointDiff)){
         state = heating;
@@ -196,12 +190,11 @@ void loop() {
     
     case shut_down: // this state is just used for when the system is off. (so its almost useless)
       cool_down();
-      //state = changed //use this for state logic change
       break;
 
     //TODO: manage the isworky etc states here
   }
-  check_movement();   // read vibration switch
+  // check_movement();   // read vibration switch
   
   if      (inOffMode)   Setpoint = 0;
   else                  Setpoint = SetTemp;
@@ -211,7 +204,8 @@ void loop() {
   if      (showPopup)  PopupScreen(remainingSeconds);  // Show countdown if popup is active
   else if (IdleScreen)  OffScreen();                    // Show idle screen
   else                 MainScreen();                   // Show the regular screen
-  // Serial.println(goneMinutes);
+  // Serial.println(sleepmillis);
+  // Serial.println(handleMoved);
   // delay(100);
   // if(state == heating) Serial.println("RAMP UP");
   // else if(state == shut_down) Serial.println("SHUT DOWN");
@@ -231,11 +225,13 @@ void ROTARYCheck() {
     beep();
     buttonmillis = millis();
     while( (!digitalRead(BUTTON_PIN)) && ((millis() - buttonmillis) < 500));
+    //long press saves current temp
     if ((millis() - buttonmillis) >= 500){
       beep();
       DefaultTemp = SetTemp;
       updateEEPROM();
     }
+    //short press opens menu
     else {
       handleMoved = true;
       SetupScreen();
@@ -254,7 +250,7 @@ int getRotary() {
 }
 
 bool countdownBeeped = false;
-void SLEEPCheck(int &remainingSeconds) {
+void SLEEPCheck() {
   if (handleMoved) {
     if ((CurrentTemp + 20) < SetTemp) // if temp is well below setpoint
       digitalWrite(CONTROL_PIN, LOW); // then start the heater right now
@@ -264,31 +260,31 @@ void SLEEPCheck(int &remainingSeconds) {
     sleepmillis = millis();           // reset sleep timer
     countdownBeeped = false;          // reset beep flag
     showPopup  = false;               // Reset popup flag if handle was moved
-    IdleScreen = false;               // Reset Idle flag if handle was moved
+    if (systemoff == false) IdleScreen = false;        // Reset Idle flag if handle was moved
   }
 
-  // check time passed since the handle was moved
-  goneMinutes = (millis() - sleepmillis) / 60000;
-  unsigned long remainingMillis = (millis() - sleepmillis) % 60000;
-  remainingSeconds = (60000 - remainingMillis) / 1000;
-
+  // // check time passed since the handle was moved
+  elapsedSeconds   = (millis() - sleepmillis) / 1000;
+  remainingSeconds = (time2off*60) - elapsedSeconds;
+  
   // If less than a minute is left, activate the popup screen
-  if (!inOffMode && (time2off > 0) && (goneMinutes >= (time2off - 1)) && remainingSeconds <= 40) {
-    showPopup = true;    // Enable the popup
-    PopupScreen(remainingSeconds);  // Show countdown popup screen
-    
-    // Beep only once when less than a minute remains
+  if ((remainingSeconds >= 1)  && (remainingSeconds <= warningInterval) && (!inOffMode && (time2off > 0)) && (IdleScreen == false)) {
+    showPopup = true;               // Enable the popup
+    PopupScreen(remainingSeconds);  //countdown popup screen
+    //beep twice
     if (!countdownBeeped) {
       beep(); delay(100); beep();
-      countdownBeeped = true;  // Set flag to prevent further beeps
+      countdownBeeped = true;       // Set flag to prevent further beeps
     }
   }
 
-  if ((!inOffMode) && (time2off > 0) && (goneMinutes >= time2off)) {
+  // if shutdown time has passed
+  if ((remainingSeconds < 1) && (!inOffMode) && (time2off > 0) && (!systemoff)){
     inOffMode = true;
     shutdown_beep();
     showPopup = false;  // Disable the popup when the system turns off
     IdleScreen = true;   // start idle sreen
+    systemoff = true;    //turn off system
     if (state == heating || state == controlling) {
       state = shut_down;
     }
@@ -297,7 +293,6 @@ void SLEEPCheck(int &remainingSeconds) {
     }
   }
 }
-
 
 
 void read_temperature(){
@@ -328,21 +323,6 @@ void read_temperature(){
     isWorky = false;
   }
 }
-// // Average several ADC readings in sleep mode to denoise
-// uint16_t denoiseAnalog (byte port) {
-//   uint16_t result = 0;
-//   ADCSRA |= bit (ADEN) | bit (ADIF);    // Enable ADC, clear interrupt flag
-//   if (port >= A0) port -= A0;           // Set port
-//   ADMUX = (0x0F & port) | bit(REFS0);   // Reference to AVcc
-//   set_sleep_mode(SLEEP_MODE_ADC);       // Sleep during sample for noise reduction
-//   for (uint8_t i = 0; i < 32; i++) {    // Get 32 readings
-//     sleep_mode();                       // Sleep while ADC samples
-//     while (bitRead(ADCSRA, ADSC));      // Wait for sampling completion
-//     result += ADC;                      // Sum the readings
-//   }
-//   bitClear(ADCSRA, ADEN);               // Disable ADC
-//   return (result >> 5);                 // Return averaged result (divided by 32)
-// }
 
 //change this one for pin change interrupt on pin 12 (for the tilt switch)
 void check_movement(){
@@ -455,6 +435,7 @@ void cool_down(void){
 
 
 // draws the main screen
+//change this with an if (if popup show popup, if system off show system off, else show main screen)
 void MainScreen() {
   u8g.firstPage();
   do {
@@ -548,15 +529,16 @@ void SetupScreen() {
   bool repeat = true;
   
   while (repeat) {
-    PID_control();
+    PID_control(); //TODO: debug this
     selection = MenuScreen(SetupItems, sizeof(SetupItems), selection);
     switch (selection) {
       case 0:   TempScreen(); break;
-      case 1:   TimerScreen(); break;
+      case 1:   TimerScreen(); repeat = false; break;
       case 2:   PIDenable = MenuScreen(ControlTypeItems, sizeof(ControlTypeItems), PIDenable); break;
       case 3:   MainScrType = MenuScreen(MainScreenItems, sizeof(MainScreenItems), MainScrType); repeat = false; break;
       case 4:   beepEnable = MenuScreen(BuzzerItems, sizeof(BuzzerItems), beepEnable); break;
       case 5:   InfoScreen(); break;
+      case 6:   TurnOff(); repeat = false; break;
       default:  repeat = false; break;
     }
   }  
@@ -564,6 +546,13 @@ void SetupScreen() {
   handleMoved = true;
   SetTemp = SaveSetTemp;
   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp);
+}
+void TurnOff(){
+  state = shut_down; // shut heater off
+  shutdown_beep();
+  IdleScreen = true;
+  systemoff = true;
+  inOffMode = true;
 }
 // temperature settings screen
 void TempScreen() {
@@ -765,6 +754,8 @@ ISR(PCINT2_vect) {
 
       ab0 = (a == b);
       handleMoved = true;
+      IdleScreen  = false;
+      systemoff   = false;
       if (state == shut_down){
         state = heating;
       }
